@@ -1,6 +1,8 @@
-/* SDSLib, A C dynamic strings library
+/* SDSLib 2.0 -- A C dynamic strings library
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2015, Oran Agra
+ * Copyright (c) 2015, Redis Labs, Inc
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,6 +34,7 @@
 #define __SDS_H
 
 #define SDS_MAX_PREALLOC (1024*1024)
+const char *SDS_NOINIT;
 
 #include <sys/types.h>
 #include <stdarg.h>
@@ -234,11 +237,11 @@ sds sdscatprintf(sds s, const char *fmt, ...);
 
 sds sdscatfmt(sds s, char const *fmt, ...);
 sds sdstrim(sds s, const char *cset);
-void sdsrange(sds s, int start, int end);
+void sdsrange(sds s, ssize_t start, ssize_t end);
 void sdsupdatelen(sds s);
 void sdsclear(sds s);
 int sdscmp(const sds s1, const sds s2);
-sds *sdssplitlen(const char *s, int len, const char *sep, int seplen, int *count);
+sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *count);
 void sdsfreesplitres(sds *tokens, int count);
 void sdstolower(sds s);
 void sdstoupper(sds s);
@@ -247,13 +250,22 @@ sds sdscatrepr(sds s, const char *p, size_t len);
 sds *sdssplitargs(const char *line, int *argc);
 sds sdsmapchars(sds s, const char *from, const char *to, size_t setlen);
 sds sdsjoin(char **argv, int argc, char *sep);
+sds sdsjoinsds(sds *argv, int argc, const char *sep, size_t seplen);
 
 /* Low level functions exposed to the user API */
 sds sdsMakeRoomFor(sds s, size_t addlen);
-void sdsIncrLen(sds s, int incr);
+void sdsIncrLen(sds s, ssize_t incr);
 sds sdsRemoveFreeSpace(sds s);
 size_t sdsAllocSize(sds s);
-size_t sdsZmallocSize(sds s);
+void *sdsAllocPtr(sds s);
+
+/* Export the allocator used by SDS to the program using SDS.
+ * Sometimes the program SDS is linked to, may use a different set of
+ * allocators, but may want to allocate or free things that SDS will
+ * respectively free or allocate. */
+void *sds_malloc(size_t size);
+void *sds_realloc(void *ptr, size_t size);
+void sds_free(void *ptr);
 
 #ifdef REDIS_TEST
 int sdsTest(int argc, char *argv[]);

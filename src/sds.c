@@ -1,6 +1,8 @@
-/* SDSLib, A C dynamic strings library
+/* SDSLib 2.0 -- A C dynamic strings library
  *
- * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2015, Oran Agra
+ * Copyright (c) 2015, Redis Labs, Inc
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,8 +35,11 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 #include "sds.h"
-#include "zmalloc.h"
+#include "sdsalloc.h"
+
+const char *SDS_NOINIT = "SDS_NOINIT";
 
 static inline int sdsHdrSize(char type) {
     switch(type&SDS_TYPE_MASK) {
@@ -53,20 +58,25 @@ static inline int sdsHdrSize(char type) {
 }
 
 static inline char sdsReqType(size_t string_size) {
-    if (string_size < 32)
+    if (string_size < 1<<5)
         return SDS_TYPE_5;
-    if (string_size < 0xff)
+    if (string_size < 1<<8)
         return SDS_TYPE_8;
-    if (string_size < 0xffff)
+    if (string_size < 1<<16)
         return SDS_TYPE_16;
-    if (string_size < 0xffffffff)
+#if (LONG_MAX == LLONG_MAX)
+    if (string_size < 1ll<<32)
         return SDS_TYPE_32;
     return SDS_TYPE_64;
+#else
+    return SDS_TYPE_32;
+#endif
 }
 
 /* Create a new sds string with the content specified by the 'init' pointer
  * and 'initlen'.
  * If NULL is used for 'init' the string is initialized with zero bytes.
+ * If SDS_NOINIT is used, the buffer is left uninitialized;
  *
  * The string is always null-termined (all the sds strings are, always) so
  * even if you create an sds string with:
@@ -86,8 +96,10 @@ sds sdsnewlen(const void *init, size_t initlen) {
     int hdrlen = sdsHdrSize(type);
     unsigned char *fp; /* flags pointer. */
 
-    sh = zmalloc(hdrlen+initlen+1);
-    if (!init)
+    sh = s_malloc(hdrlen+initlen+1);
+    if (init==SDS_NOINIT)
+        init = NULL;
+    else if (!init)
         memset(sh, 0, hdrlen+initlen+1);
     if (sh == NULL) return NULL;
     s = (char*)sh+hdrlen;
@@ -152,7 +164,7 @@ sds sdsdup(const sds s) {
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
-    zfree((char*)s-sdsHdrSize(s[-1]));
+    s_free((char*)s-sdsHdrSize(s[-1]));
 }
 
 /* Set the sds string length to the length as obtained with strlen(), so
@@ -170,7 +182,7 @@ void sdsfree(sds s) {
  * the output will be "6" as the string was modified but the logical length
  * remains 6 bytes. */
 void sdsupdatelen(sds s) {
-    int reallen = strlen(s);
+    size_t reallen = strlen(s);
     sdssetlen(s, reallen);
 }
 
@@ -216,16 +228,16 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
 
     hdrlen = sdsHdrSize(type);
     if (oldtype==type) {
-        newsh = zrealloc(sh, hdrlen+newlen+1);
+        newsh = s_realloc(sh, hdrlen+newlen+1);
         if (newsh == NULL) return NULL;
         s = (char*)newsh+hdrlen;
     } else {
         /* Since the header size changes, need to move the string forward,
          * and can't use realloc */
-        newsh = zmalloc(hdrlen+newlen+1);
+        newsh = s_malloc(hdrlen+newlen+1);
         if (newsh == NULL) return NULL;
         memcpy((char*)newsh+hdrlen, s, len+1);
-        zfree(sh);
+        s_free(sh);
         s = (char*)newsh+hdrlen;
         s[-1] = type;
         sdssetlen(s, len);
@@ -243,21 +255,32 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
 sds sdsRemoveFreeSpace(sds s) {
     void *sh, *newsh;
     char type, oldtype = s[-1] & SDS_TYPE_MASK;
-    int hdrlen;
+    int hdrlen, oldhdrlen = sdsHdrSize(oldtype);
     size_t len = sdslen(s);
-    sh = (char*)s-sdsHdrSize(oldtype);
+    size_t avail = sdsavail(s);
+    sh = (char*)s-oldhdrlen;
 
+    /* Return ASAP if there is no space left. */
+    if (avail == 0) return s;
+
+    /* Check what would be the minimum SDS header that is just good enough to
+     * fit this string. */
     type = sdsReqType(len);
     hdrlen = sdsHdrSize(type);
-    if (oldtype==type) {
-        newsh = zrealloc(sh, hdrlen+len+1);
+
+    /* If the type is the same, or at least a large enough type is still
+     * required, we just realloc(), letting the allocator to do the copy
+     * only if really needed. Otherwise if the change is huge, we manually
+     * reallocate the string to use the different header type. */
+    if (oldtype==type || type > SDS_TYPE_8) {
+        newsh = s_realloc(sh, oldhdrlen+len+1);
         if (newsh == NULL) return NULL;
-        s = (char*)newsh+hdrlen;
+        s = (char*)newsh+oldhdrlen;
     } else {
-        newsh = zmalloc(hdrlen+len+1);
+        newsh = s_malloc(hdrlen+len+1);
         if (newsh == NULL) return NULL;
         memcpy((char*)newsh+hdrlen, s, len+1);
-        zfree(sh);
+        s_free(sh);
         s = (char*)newsh+hdrlen;
         s[-1] = type;
         sdssetlen(s, len);
@@ -266,7 +289,7 @@ sds sdsRemoveFreeSpace(sds s) {
     return s;
 }
 
-/* Return the total size of the allocation of the specifed sds string,
+/* Return the total size of the allocation of the specified sds string,
  * including:
  * 1) The sds header before the pointer.
  * 2) The string.
@@ -278,11 +301,10 @@ size_t sdsAllocSize(sds s) {
     return sdsHdrSize(s[-1])+alloc+1;
 }
 
-/* Return the size consumed from the allocator,
- * including internal fragmentation */
-size_t sdsZmallocSize(sds s) {
-    struct sdshdr *sh = (void*) (s-sdsHdrSize(s[-1]));
-    return zmalloc_size(sh);
+/* Return the pointer of the actual SDS allocation (normally SDS strings
+ * are referenced by the start of the string buffer). */
+void *sdsAllocPtr(sds s) {
+    return (void*) (s-sdsHdrSize(s[-1]));
 }
 
 /* Increment the sds length and decrements the left free space at the
@@ -308,7 +330,7 @@ size_t sdsZmallocSize(sds s) {
  * ... check for nread <= 0 and handle it ...
  * sdsIncrLen(s, nread);
  */
-void sdsIncrLen(sds s, int incr) {
+void sdsIncrLen(sds s, ssize_t incr) {
     unsigned char flags = s[-1];
     size_t len;
     switch(flags&SDS_TYPE_MASK) {
@@ -505,7 +527,7 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
     /* We try to start using a static buffer for speed.
      * If not possible we revert to heap allocation. */
     if (buflen > sizeof(staticbuf)) {
-        buf = zmalloc(buflen);
+        buf = s_malloc(buflen);
         if (buf == NULL) return NULL;
     } else {
         buflen = sizeof(staticbuf);
@@ -519,9 +541,9 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
         vsnprintf(buf, buflen, fmt, cpy);
         va_end(cpy);
         if (buf[buflen-2] != '\0') {
-            if (buf != staticbuf) zfree(buf);
+            if (buf != staticbuf) s_free(buf);
             buflen *= 2;
-            buf = zmalloc(buflen);
+            buf = s_malloc(buflen);
             if (buf == NULL) return NULL;
             continue;
         }
@@ -530,7 +552,7 @@ sds sdscatvprintf(sds s, const char *fmt, va_list ap) {
 
     /* Finally concat the obtained string to the SDS string and return it. */
     t = sdscat(s, buf);
-    if (buf != staticbuf) zfree(buf);
+    if (buf != staticbuf) s_free(buf);
     return t;
 }
 
@@ -578,7 +600,7 @@ sds sdscatprintf(sds s, const char *fmt, ...) {
 sds sdscatfmt(sds s, char const *fmt, ...) {
     size_t initlen = sdslen(s);
     const char *f = fmt;
-    int i;
+    long i;
     va_list ap;
 
     va_start(ap,fmt);
@@ -677,7 +699,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
  * s = sdstrim(s,"Aa. :");
  * printf("%s\n", s);
  *
- * Output will be just "Hello World".
+ * Output will be just "HelloWorld".
  */
 sds sdstrim(sds s, const char *cset) {
     char *start, *end, *sp, *ep;
@@ -710,7 +732,7 @@ sds sdstrim(sds s, const char *cset) {
  * s = sdsnew("Hello World");
  * sdsrange(s,1,-1); => "ello World"
  */
-void sdsrange(sds s, int start, int end) {
+void sdsrange(sds s, ssize_t start, ssize_t end) {
     size_t newlen, len = sdslen(s);
 
     if (len == 0) return;
@@ -724,9 +746,9 @@ void sdsrange(sds s, int start, int end) {
     }
     newlen = (start > end) ? 0 : (end-start)+1;
     if (newlen != 0) {
-        if (start >= (signed)len) {
+        if (start >= (ssize_t)len) {
             newlen = 0;
-        } else if (end >= (signed)len) {
+        } else if (end >= (ssize_t)len) {
             end = len-1;
             newlen = (start > end) ? 0 : (end-start)+1;
         }
@@ -740,14 +762,14 @@ void sdsrange(sds s, int start, int end) {
 
 /* Apply tolower() to every character of the sds string 's'. */
 void sdstolower(sds s) {
-    int len = sdslen(s), j;
+    size_t len = sdslen(s), j;
 
     for (j = 0; j < len; j++) s[j] = tolower(s[j]);
 }
 
 /* Apply toupper() to every character of the sds string 's'. */
 void sdstoupper(sds s) {
-    int len = sdslen(s), j;
+    size_t len = sdslen(s), j;
 
     for (j = 0; j < len; j++) s[j] = toupper(s[j]);
 }
@@ -771,7 +793,7 @@ int sdscmp(const sds s1, const sds s2) {
     l2 = sdslen(s2);
     minlen = (l1 < l2) ? l1 : l2;
     cmp = memcmp(s1,s2,minlen);
-    if (cmp == 0) return l1-l2;
+    if (cmp == 0) return l1>l2? 1: (l1<l2? -1: 0);
     return cmp;
 }
 
@@ -791,13 +813,14 @@ int sdscmp(const sds s1, const sds s2) {
  * requires length arguments. sdssplit() is just the
  * same function but for zero-terminated strings.
  */
-sds *sdssplitlen(const char *s, int len, const char *sep, int seplen, int *count) {
-    int elements = 0, slots = 5, start = 0, j;
+sds *sdssplitlen(const char *s, ssize_t len, const char *sep, int seplen, int *count) {
+    int elements = 0, slots = 5;
+    long start = 0, j;
     sds *tokens;
 
     if (seplen < 1 || len < 0) return NULL;
 
-    tokens = zmalloc(sizeof(sds)*slots);
+    tokens = s_malloc(sizeof(sds)*slots);
     if (tokens == NULL) return NULL;
 
     if (len == 0) {
@@ -810,7 +833,7 @@ sds *sdssplitlen(const char *s, int len, const char *sep, int seplen, int *count
             sds *newtokens;
 
             slots *= 2;
-            newtokens = zrealloc(tokens,sizeof(sds)*slots);
+            newtokens = s_realloc(tokens,sizeof(sds)*slots);
             if (newtokens == NULL) goto cleanup;
             tokens = newtokens;
         }
@@ -834,7 +857,7 @@ cleanup:
     {
         int i;
         for (i = 0; i < elements; i++) sdsfree(tokens[i]);
-        zfree(tokens);
+        s_free(tokens);
         *count = 0;
         return NULL;
     }
@@ -845,7 +868,7 @@ void sdsfreesplitres(sds *tokens, int count) {
     if (!tokens) return;
     while(count--)
         sdsfree(tokens[count]);
-    zfree(tokens);
+    s_free(tokens);
 }
 
 /* Append to the sds string "s" an escaped string representation where
@@ -1019,13 +1042,13 @@ sds *sdssplitargs(const char *line, int *argc) {
                 if (*p) p++;
             }
             /* add the token to the vector */
-            vector = zrealloc(vector,((*argc)+1)*sizeof(char*));
+            vector = s_realloc(vector,((*argc)+1)*sizeof(char*));
             vector[*argc] = current;
             (*argc)++;
             current = NULL;
         } else {
             /* Even on empty input string return something not NULL. */
-            if (vector == NULL) vector = zmalloc(sizeof(void*));
+            if (vector == NULL) vector = s_malloc(sizeof(void*));
             return vector;
         }
     }
@@ -1033,7 +1056,7 @@ sds *sdssplitargs(const char *line, int *argc) {
 err:
     while((*argc)--)
         sdsfree(vector[*argc]);
-    zfree(vector);
+    s_free(vector);
     if (current) sdsfree(current);
     *argc = 0;
     return NULL;
@@ -1075,7 +1098,28 @@ sds sdsjoin(char **argv, int argc, char *sep) {
     return join;
 }
 
-#if defined(REDIS_TEST) || defined(SDS_TEST_MAIN)
+/* Like sdsjoin, but joins an array of SDS strings. */
+sds sdsjoinsds(sds *argv, int argc, const char *sep, size_t seplen) {
+    sds join = sdsempty();
+    int j;
+
+    for (j = 0; j < argc; j++) {
+        join = sdscatsds(join, argv[j]);
+        if (j != argc-1) join = sdscatlen(join,sep,seplen);
+    }
+    return join;
+}
+
+/* Wrappers to the allocators used by SDS. Note that SDS will actually
+ * just use the macros defined into sdsalloc.h in order to avoid to pay
+ * the overhead of function calls. Here we define these wrappers only for
+ * the programs SDS is linked to, if they want to touch the SDS internals
+ * even if they use a different allocator. */
+void *sds_malloc(size_t size) { return s_malloc(size); }
+void *sds_realloc(void *ptr, size_t size) { return s_realloc(ptr,size); }
+void sds_free(void *ptr) { s_free(ptr); }
+
+#if defined(SDS_TEST_MAIN)
 #include <stdio.h>
 #include "testhelp.h"
 #include "limits.h"
